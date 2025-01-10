@@ -14,7 +14,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/splitting/video_splitting.py" />
-    <option name="PARAMETERS" value="--video-list processed_videos.txt --event-timecode event_timecode.json --output-folder &quot;F:\VideoPipeDatasets\youtube-bb\classification_train\output3&quot;" />
+    <option name="PARAMETERS" value="--videos-root-dir &quot;F:\VideoPipeDatasets\youtube-bb\test&quot; --output-dir &quot;F:\VideoPipeDatasets\youtube-bb\test_output&quot; --clear-output" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />

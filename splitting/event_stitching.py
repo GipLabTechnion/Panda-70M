@@ -15,37 +15,50 @@ from models import imagebind_model
 from models.imagebind_model import ModalityType
 
 
+def get_video_files(root_dir):
+    """Recursively find all video files in the given directory"""
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+    video_files = []
+
+    for root, _, files in os.walk(root_dir):
+        for file in files:
+            if any(file.lower().endswith(ext) for ext in video_extensions):
+                video_files.append(os.path.join(root, file))
+
+    return video_files
+
+
 def read_videoframe(video_path, frame_idx):
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     res, frame = cap.read()
     if res:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (224,224), interpolation = cv2.INTER_LINEAR)
+        frame = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_LINEAR)
     else:
-        frame = np.zeros((224,224,3), dtype=np.uint8)
+        frame = np.zeros((224, 224, 3), dtype=np.uint8)
     return frame, res
 
 
 def transfer_timecode(frameidx, fps):
     timecode = []
     for (start_idx, end_idx) in frameidx:
-        s = str(timedelta(seconds=start_idx/fps, microseconds=1))[:-3]
-        e = str(timedelta(seconds=end_idx/fps, microseconds=1))[:-3]
+        s = str(timedelta(seconds=start_idx / fps, microseconds=1))[:-3]
+        e = str(timedelta(seconds=end_idx / fps, microseconds=1))[:-3]
         timecode.append([s, e])
     return timecode
 
 
 def extract_cutscene_feature(video_path, cutscenes):
-    features = torch.empty((0,1024))
+    features = torch.empty((0, 1024))
     res = []
     num_parallel_cutscene = 128
     for i in range(0, len(cutscenes), num_parallel_cutscene):
-        cutscenes_sub = cutscenes[i:i+num_parallel_cutscene]
+        cutscenes_sub = cutscenes[i:i + num_parallel_cutscene]
         frame_idx = []
         for cutscene in cutscenes_sub:
-            start_frame_idx = int(0.95*cutscene[0] + 0.05*(cutscene[1]-1))
-            end_frame_idx = int(0.05*cutscene[0] + 0.95*(cutscene[1]-1))
+            start_frame_idx = int(0.95 * cutscene[0] + 0.05 * (cutscene[1] - 1))
+            end_frame_idx = int(0.05 * cutscene[0] + 0.95 * (cutscene[1] - 1))
             frame_idx.extend([(video_path, start_frame_idx), (video_path, end_frame_idx)])
 
         with Pool(8) as p:
@@ -65,8 +78,8 @@ def verify_cutscene(cutscenes, cutscene_feature, cutscene_status, transition_thr
     cutscenes_new = []
     cutscene_feature_new = []
     for i, cutscene in enumerate(cutscenes):
-        start_frame_fet, end_frame_fet = cutscene_feature[2*i], cutscene_feature[2*i+1]
-        start_frame_res, end_frame_res = cutscene_status[2*i], cutscene_status[2*i+1]
+        start_frame_fet, end_frame_fet = cutscene_feature[2 * i], cutscene_feature[2 * i + 1]
+        start_frame_res, end_frame_res = cutscene_status[2 * i], cutscene_status[2 * i + 1]
         diff = (start_frame_fet - end_frame_fet).pow(2).sum().sqrt()
 
         # Remove condition 1: start_frame or end_frame cannot be loaded
@@ -84,6 +97,10 @@ def verify_cutscene(cutscenes, cutscene_feature, cutscene_status, transition_thr
 def cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.6):
     assert len(cutscenes) == len(cutscene_feature)
     num_cutscenes = len(cutscenes)
+
+    # Add minimal fix for empty cutscenes
+    if num_cutscenes == 0:
+        return [], []
 
     events = []
     event_feature = []
@@ -111,27 +128,27 @@ def cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.6):
     return events, event_feature
 
 
-def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60, redundant_event_threshold=0.4, trim_begin_last_percent=0.1, still_event_threshold=0.1): # add remove no change event
+def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60, redundant_event_threshold=0.4, trim_begin_last_percent=0.1, still_event_threshold=0.1):
     assert len(events) == len(event_feature)
     num_events = len(events)
-    
+
     events_final = []
-    event_feature_final = torch.empty((0,1024))
-    
-    min_event_len = min_event_len*fps
-    max_event_len = max_event_len*fps
+    event_feature_final = torch.empty((0, 1024))
+
+    min_event_len = min_event_len * fps
+    max_event_len = max_event_len * fps
 
     for i in range(num_events):
         assert len(events[i]) == len(event_feature[i])
         # Remove condition 1: shorter than min_event_len
         if (events[i][-1] - events[i][0]) < min_event_len:
             continue
-            
+
         # Remove condition 2: within-event difference is too small
         diff = (event_feature[i][0] - event_feature[i][-1]).pow(2).sum().sqrt()
         if diff < still_event_threshold:
             continue
-        
+
         avg_feature = torch.stack(event_feature[i]).mean(axis=0)
         # Remove condition 3: too similar to the previous events
         diff = (event_feature_final - avg_feature).pow(2).sum(axis=1).sqrt()
@@ -139,19 +156,21 @@ def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60
             continue
 
         # Trim the event if it is too long
-        events[i][-1] = events[i][0] + min(int(max_event_len), (events[i][-1]-events[i][0]))
-        
-        trim_len = int(trim_begin_last_percent*(events[i][-1]-events[i][0]))
-        events_final.append([events[i][0]+trim_len, events[i][-1]-trim_len])
+        events[i][-1] = events[i][0] + min(int(max_event_len), (events[i][-1] - events[i][0]))
+
+        trim_len = int(trim_begin_last_percent * (events[i][-1] - events[i][0]))
+        events_final.append([events[i][0] + trim_len, events[i][-1] - trim_len])
         event_feature_final = torch.vstack((event_feature_final, avg_feature))
-        
+
     return events_final, event_feature_final
 
 
 def write_json_file(data, output_file):
-    data = json.dumps(data, indent = 4)
+    data = json.dumps(data, indent=4)
+
     def repl_func(match: re.Match):
         return " ".join(match.group().split())
+
     data = re.sub(r"(?<=\[)[^\[\]]+(?=])", repl_func, data)
     data = re.sub(r'\[\s+', '[', data)
     data = re.sub(r'],\s+\[', '], [', data)
@@ -162,20 +181,30 @@ def write_json_file(data, output_file):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Event Stitching")
-    parser.add_argument("--video-list", type=str, required=True)
-    parser.add_argument("--cutscene-frameidx", type=str, required=True)
-    parser.add_argument("--output-json-file", type=str, default="event_timecode.json")
+    parser.add_argument("--videos-root-dir", type=str, required=True,
+                        help="Root directory containing video files and cutscene_frame_idx.json")
     args = parser.parse_args()
+
+    # Check for cutscene_frame_idx.json
+    cutscene_json_path = os.path.join(args.videos_root_dir, "cutscene_frame_idx.json")
+    if not os.path.exists(cutscene_json_path):
+        print(f"Error: cutscene_frame_idx.json not found in {args.videos_root_dir}")
+        sys.exit(1)
+
+    # Get list of video files
+    video_paths = get_video_files(args.videos_root_dir)
+    if not video_paths:
+        print(f"No video files found in {args.videos_root_dir}")
+        sys.exit(1)
 
     device = "cuda"
     model = imagebind_model.imagebind_huge(pretrained=True)
     model.eval()
     model.to(device)
 
-    f = open(args.video_list, "r")
-    video_paths = f.read().splitlines()
-    f = open(args.cutscene_frameidx)
-    video_cutscenes = json.load(f)
+    # Load cutscene data
+    with open(cutscene_json_path) as f:
+        video_cutscenes = json.load(f)
 
     image_transform = transforms.Compose(
         [
@@ -189,15 +218,23 @@ if __name__ == "__main__":
 
     video_events = {}
     for video_path in tqdm(video_paths):
+        video_basename = os.path.basename(video_path)
+        if video_basename not in video_cutscenes:
+            print(f"Warning: Skipping {video_basename} - no cutscene data found")
+            continue
+
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
-        cutscene = video_cutscenes[video_path.split("/")[-1]]
+        cutscene = video_cutscenes[video_basename]
 
         cutscene_raw_feature, cutscene_raw_status = extract_cutscene_feature(video_path, cutscene)
         cutscenes, cutscene_feature = verify_cutscene(cutscene, cutscene_raw_feature, cutscene_raw_status, transition_threshold=0.5)
         events_raw, event_feature_raw = cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.3)
-        # events, event_feature = verify_event(events_raw, event_feature_raw, fps, min_event_len=2.0, max_event_len=1200, redundant_event_threshold=0.0, trim_begin_last_percent=0.0, still_event_threshold=0.15)
         events, event_feature = verify_event(events_raw, event_feature_raw, fps, min_event_len=0.5, max_event_len=10, redundant_event_threshold=0.1, trim_begin_last_percent=0.1, still_event_threshold=0.05)
-        video_events[video_path.split("/")[-1]] = transfer_timecode(events, fps)
-       
-    write_json_file(video_events, args.output_json_file)
+        video_events[video_basename] = transfer_timecode(events, fps)
+
+    # Save results
+    output_json_file = os.path.join(args.videos_root_dir, "event_timecode.json")
+    print(f"\nWriting results to {output_json_file}")
+    write_json_file(video_events, output_json_file)
+    print("Done!")

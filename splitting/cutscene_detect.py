@@ -7,6 +7,19 @@ import numpy as np
 import sys
 
 
+def get_video_files(root_dir):
+    """Recursively find all video files in the given directory"""
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+    video_files = []
+
+    for root, _, files in os.walk(root_dir):
+        for file in files:
+            if any(file.lower().endswith(ext) for ext in video_extensions):
+                video_files.append(os.path.join(root, file))
+
+    return video_files
+
+
 def cutscene_detection(video_path, cutscene_threshold=25, max_cutscene_len=10, min_scene_len=15):
     scene_list = detect(video_path, ContentDetector(threshold=cutscene_threshold, min_scene_len=min_scene_len), start_in_scene=True)
     end_frame_idx = [0]
@@ -32,10 +45,10 @@ def process_single_video(video_path, process_id, progress_dict, cutscene_thresho
     try:
         cutscenes_raw = cutscene_detection(video_path, cutscene_threshold, max_cutscene_len, min_scene_len)
         print(f"Worker {process_id}: Processed {video_path}")
-        result = (video_path.split("/")[-1], cutscenes_raw)
+        result = (os.path.basename(video_path), cutscenes_raw)
     except Exception as e:
         print(f"Worker {process_id}: Error processing {video_path}: {str(e)}")
-        result = (video_path.split("/")[-1], [])
+        result = (os.path.basename(video_path), [])
 
     # Update progress
     progress_dict['processed'] += 1
@@ -61,14 +74,11 @@ def write_json_file(data, output_file):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cutscene Detection")
-    parser.add_argument("--input-video-list", type=str, required=True,
-                        help="Input file containing list of video paths")
-    parser.add_argument("--output-video-list", type=str, required=True,
-                        help="Output file to save processed video paths")
-    parser.add_argument("--output-json-file", type=str, default="cutscene_frame_idx.json")
+    parser.add_argument("--videos-root-dir", type=str, required=True,
+                        help="Root directory containing video files")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Number of worker processes (default: number of CPU cores - 1)")
-    parser.add_argument("--cutscene-threshold", type=float, default=10,
+    parser.add_argument("--cutscene-threshold", type=float, default=25,
                         help="Threshold for cutscene detection (default: 25)")
     parser.add_argument("--max-cutscene-len", type=float, default=5,
                         help="Maximum length of cutscenes in seconds (default: 5)")
@@ -78,18 +88,16 @@ if __name__ == "__main__":
                         help="Maximum number of videos to process (default: process all)")
     args = parser.parse_args()
 
-    # Read video paths
-    with open(args.input_video_list, "r") as f:
-        video_paths = f.read().splitlines()
+    # Get all video files from the root directory
+    video_paths = get_video_files(args.videos_root_dir)
+
+    if not video_paths:
+        print(f"No video files found in {args.videos_root_dir}")
+        sys.exit(1)
 
     # Limit number of videos if specified
     if args.max_videos is not None:
         video_paths = video_paths[:args.max_videos]
-
-    # Save the list of videos to be processed
-    with open(args.output_video_list, "w") as f:
-        f.write("\n".join(video_paths))
-    print(f"Saved video list to process to {args.output_video_list}")
 
     total_videos = len(video_paths)
     print(f"Found {total_videos} videos to process")
@@ -124,6 +132,8 @@ if __name__ == "__main__":
     # Convert results to dictionary
     video_cutscenes = dict(results)
 
-    print(f"Writing results to {args.output_json_file}")
-    write_json_file(video_cutscenes, args.output_json_file)
+    # Save results in the videos root directory
+    output_json_file = os.path.join(args.videos_root_dir, "cutscene_frame_idx.json")
+    print(f"Writing results to {output_json_file}")
+    write_json_file(video_cutscenes, output_json_file)
     print("Done!")

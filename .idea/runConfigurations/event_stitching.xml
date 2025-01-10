@@ -14,7 +14,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/splitting/event_stitching.py" />
-    <option name="PARAMETERS" value="--video-list &quot;processed_videos.txt&quot; --cutscene-frameidx &quot;cutscene_frame_idx.json&quot; --output-json-file &quot;event_timecode.json&quot;" />
+    <option name="PARAMETERS" value="--videos-root-dir &quot;F:\VideoPipeDatasets\youtube-bb\test&quot;" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />
