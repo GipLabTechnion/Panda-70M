@@ -128,7 +128,9 @@ def cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.6):
     return events, event_feature
 
 
-def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60, redundant_event_threshold=0.4, trim_begin_last_percent=0.1, still_event_threshold=0.1):
+def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60,
+                 redundant_event_threshold=0.4, trim_begin_last_percent=0.1,
+                 still_event_threshold=0.1, min_frames=None):
     assert len(events) == len(event_feature)
     num_events = len(events)
 
@@ -137,6 +139,9 @@ def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60
 
     min_event_len = min_event_len * fps
     max_event_len = max_event_len * fps
+
+    # Track dropped events for logging
+    dropped_count = 0
 
     for i in range(num_events):
         assert len(events[i]) == len(event_feature[i])
@@ -158,10 +163,21 @@ def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60
         # Trim the event if it is too long
         events[i][-1] = events[i][0] + min(int(max_event_len), (events[i][-1] - events[i][0]))
 
+        # Calculate event length after trimming
         trim_len = int(trim_begin_last_percent * (events[i][-1] - events[i][0]))
-        events_final.append([events[i][0] + trim_len, events[i][-1] - trim_len])
+        event_start = events[i][0] + trim_len
+        event_end = events[i][-1] - trim_len
+
+        # Check minimum frame requirement if specified
+        if min_frames is not None and (event_end - event_start) < min_frames:
+            dropped_count += 1
+            continue
+
+        events_final.append([event_start, event_end])
         event_feature_final = torch.vstack((event_feature_final, avg_feature))
 
+    if dropped_count > 0:
+        print(f"Dropped {dropped_count} events that were shorter than {min_frames} frames")
     return events_final, event_feature_final
 
 
@@ -183,6 +199,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Event Stitching")
     parser.add_argument("--videos-root-dir", type=str, required=True,
                         help="Root directory containing video files and cutscene_frame_idx.json")
+    parser.add_argument("--min-frames", type=int, default=None,
+                        help="Minimum number of frames required for each event (default: None)")
     args = parser.parse_args()
 
     # Check for cutscene_frame_idx.json
@@ -230,8 +248,17 @@ if __name__ == "__main__":
         cutscene_raw_feature, cutscene_raw_status = extract_cutscene_feature(video_path, cutscene)
         cutscenes, cutscene_feature = verify_cutscene(cutscene, cutscene_raw_feature, cutscene_raw_status, transition_threshold=0.5)
         events_raw, event_feature_raw = cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.3)
-        events, event_feature = verify_event(events_raw, event_feature_raw, fps, min_event_len=0.5, max_event_len=10, redundant_event_threshold=0.1, trim_begin_last_percent=0.1, still_event_threshold=0.05)
-        video_events[video_basename] = transfer_timecode(events, fps)
+        events, event_feature = verify_event(
+            events_raw, event_feature_raw, fps,
+            min_event_len=0.5, max_event_len=10,
+            redundant_event_threshold=0.1,
+            trim_begin_last_percent=0.1,
+            still_event_threshold=0.05,
+            min_frames=args.min_frames
+        )
+
+        if events:  # Only add events if there are any after filtering
+            video_events[video_basename] = transfer_timecode(events, fps)
 
     # Save results
     output_json_file = os.path.join(args.videos_root_dir, "event_timecode.json")

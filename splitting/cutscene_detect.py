@@ -7,15 +7,30 @@ import numpy as np
 import sys
 
 
-def get_video_files(root_dir):
-    """Recursively find all video files in the given directory"""
+def get_video_resolution(video_path):
+    """Get video resolution using OpenCV"""
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return width, height
+
+
+def get_video_files(root_dir, min_dimension=None):
+    """Recursively find all video files in the given directory with optional resolution filtering"""
     video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
     video_files = []
 
     for root, _, files in os.walk(root_dir):
         for file in files:
             if any(file.lower().endswith(ext) for ext in video_extensions):
-                video_files.append(os.path.join(root, file))
+                video_path = os.path.join(root, file)
+                if min_dimension is not None:
+                    width, height = get_video_resolution(video_path)
+                    if min(width, height) < min_dimension:
+                        print(f"Skipping {file} - resolution {width}x{height} below minimum dimension {min_dimension}")
+                        continue
+                video_files.append(video_path)
 
     return video_files
 
@@ -80,19 +95,21 @@ if __name__ == "__main__":
                         help="Number of worker processes (default: number of CPU cores - 1)")
     parser.add_argument("--cutscene-threshold", type=float, default=25,
                         help="Threshold for cutscene detection (default: 25)")
-    parser.add_argument("--max-cutscene-len", type=float, default=5,
+    parser.add_argument("--max-cutscene-len", type=int, default=5,
                         help="Maximum length of cutscenes in seconds (default: 5)")
-    parser.add_argument("--min-scene-len", type=float, default=15,
+    parser.add_argument("--min-scene-len", type=int, default=15,
                         help="Minimum length of scenes in frames (default: 15)")
     parser.add_argument("--max-videos", type=int, default=None,
                         help="Maximum number of videos to process (default: process all)")
+    parser.add_argument("--min-dimension", type=int, default=None,
+                        help="Minimum width/height dimension required for processing (default: None)")
     args = parser.parse_args()
 
-    # Get all video files from the root directory
-    video_paths = get_video_files(args.videos_root_dir)
+    # Get all video files from the root directory with resolution filtering
+    video_paths = get_video_files(args.videos_root_dir, args.min_dimension)
 
     if not video_paths:
-        print(f"No video files found in {args.videos_root_dir}")
+        print(f"No valid video files found in {args.videos_root_dir}")
         sys.exit(1)
 
     # Limit number of videos if specified
@@ -100,7 +117,7 @@ if __name__ == "__main__":
         video_paths = video_paths[:args.max_videos]
 
     total_videos = len(video_paths)
-    print(f"Found {total_videos} videos to process")
+    print(f"Found {total_videos} valid videos to process")
 
     # Determine number of workers
     num_workers = args.num_workers if args.num_workers is not None else max(1, cpu_count() - 1)
