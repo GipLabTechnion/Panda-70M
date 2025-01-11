@@ -246,14 +246,14 @@ if __name__ == "__main__":
         cutscene = video_cutscenes[video_basename]
 
         cutscene_raw_feature, cutscene_raw_status = extract_cutscene_feature(video_path, cutscene)
-        cutscenes, cutscene_feature = verify_cutscene(cutscene, cutscene_raw_feature, cutscene_raw_status, transition_threshold=0.5)
+        cutscenes, cutscene_feature = verify_cutscene(cutscene, cutscene_raw_feature, cutscene_raw_status, transition_threshold=0.45)
         events_raw, event_feature_raw = cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.3)
         events, event_feature = verify_event(
             events_raw, event_feature_raw, fps,
             min_event_len=0.5, max_event_len=10,
             redundant_event_threshold=0.1,
             trim_begin_last_percent=0.1,
-            still_event_threshold=0.05,
+            still_event_threshold=0.2,
             min_frames=args.min_frames
         )
 
