@@ -2,17 +2,92 @@ import torch
 from torchvision import transforms
 from PIL import Image
 import cv2
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 from collections import defaultdict
-import os, sys, re, json, argparse
+import os, sys, re, json, argparse, time
 from datetime import datetime, timedelta
-from pytz import timezone
 from tqdm import tqdm
 import numpy as np
 
 sys.path.append('ImageBind')
 from models import imagebind_model
 from models.imagebind_model import ModalityType
+
+
+class FileLock:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.lock_path = str(file_path) + ".lock"
+        self.lock_file = None
+
+    def __enter__(self):
+        # Try to acquire lock
+        max_attempts = 60  # Maximum number of attempts (60 seconds timeout)
+        attempts = 0
+        while attempts < max_attempts:
+            try:
+                # Try to create the lock file
+                self.lock_file = open(self.lock_path, 'x')
+                return self
+            except FileExistsError:
+                # Lock file exists, wait and retry
+                time.sleep(1)
+                attempts += 1
+                if attempts >= max_attempts:
+                    raise TimeoutError(f"Could not acquire lock for {self.file_path} after {max_attempts} seconds")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_file:
+            self.lock_file.close()
+        try:
+            os.remove(self.lock_path)
+        except FileNotFoundError:
+            pass
+
+
+def safely_read_json(filepath):
+    """Read JSON file with file locking"""
+    if not os.path.exists(filepath):
+        return {}
+
+    with FileLock(filepath):
+        try:
+            with open(filepath, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def safely_write_json(filepath, data):
+    """Write JSON file with file locking"""
+    with FileLock(filepath):
+        with open(filepath, 'w') as f:
+            json_str = json.dumps(data, indent=4)
+
+            def repl_func(match: re.Match):
+                return " ".join(match.group().split())
+
+            json_str = re.sub(r"(?<=\[)[^\[\]]+(?=])", repl_func, json_str)
+            json_str = re.sub(r'\[\s+', '[', json_str)
+            json_str = re.sub(r'],\s+\[', '], [', json_str)
+            json_str = re.sub(r'\s+\]', ']', json_str)
+
+            f.write(json_str)
+
+
+def update_json_with_result(output_file, video_name, events):
+    """Update JSON file with new results"""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            current_data = safely_read_json(output_file)
+            current_data[video_name] = events
+            safely_write_json(output_file, current_data)
+            break
+        except (TimeoutError, Exception) as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to update results for {video_name} after {max_retries} attempts: {str(e)}")
+            time.sleep(1)
 
 
 def get_video_files(root_dir):
@@ -49,7 +124,7 @@ def transfer_timecode(frameidx, fps):
     return timecode
 
 
-def extract_cutscene_feature(video_path, cutscenes):
+def extract_cutscene_feature(video_path, cutscenes, num_workers=8):
     features = torch.empty((0, 1024))
     res = []
     num_parallel_cutscene = 128
@@ -61,7 +136,7 @@ def extract_cutscene_feature(video_path, cutscenes):
             end_frame_idx = int(0.05 * cutscene[0] + 0.95 * (cutscene[1] - 1))
             frame_idx.extend([(video_path, start_frame_idx), (video_path, end_frame_idx)])
 
-        with Pool(8) as p:
+        with Pool(num_workers) as p:
             results = p.starmap(read_videoframe, frame_idx)
         frames = [image_transform(Image.fromarray(i[0])) for i in results]
         res.extend([i[1] for i in results])
@@ -121,7 +196,7 @@ def cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.6):
             events[-1].extend(cutscenes[i])
             event_feature[-1].extend(cutscene_feature[i])
 
-    if len(events[-1]) == 0:
+    if len(events) > 0 and len(events[-1]) == 0:
         events.pop(-1)
         event_feature.pop(-1)
 
@@ -139,9 +214,6 @@ def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60
 
     min_event_len = min_event_len * fps
     max_event_len = max_event_len * fps
-
-    # Track dropped events for logging
-    dropped_count = 0
 
     for i in range(num_events):
         assert len(events[i]) == len(event_feature[i])
@@ -170,29 +242,37 @@ def verify_event(events, event_feature, fps, min_event_len=1.5, max_event_len=60
 
         # Check minimum frame requirement if specified
         if min_frames is not None and (event_end - event_start) < min_frames:
-            dropped_count += 1
             continue
 
         events_final.append([event_start, event_end])
         event_feature_final = torch.vstack((event_feature_final, avg_feature))
 
-    if dropped_count > 0:
-        print(f"Dropped {dropped_count} events that were shorter than {min_frames} frames")
     return events_final, event_feature_final
 
 
-def write_json_file(data, output_file):
-    data = json.dumps(data, indent=4)
+def process_video(video_path, cutscenes, min_frames=None, num_workers=8):
+    """Process a single video and return its events"""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
 
-    def repl_func(match: re.Match):
-        return " ".join(match.group().split())
+        cutscene_raw_feature, cutscene_raw_status = extract_cutscene_feature(video_path, cutscenes, num_workers)
+        cutscenes, cutscene_feature = verify_cutscene(cutscenes, cutscene_raw_feature, cutscene_raw_status, transition_threshold=0.45)
+        events_raw, event_feature_raw = cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.3)
+        events, event_feature = verify_event(
+            events_raw, event_feature_raw, fps,
+            min_event_len=0.5, max_event_len=10,
+            redundant_event_threshold=0.1,
+            trim_begin_last_percent=0.1,
+            still_event_threshold=0.2,
+            min_frames=min_frames
+        )
 
-    data = re.sub(r"(?<=\[)[^\[\]]+(?=])", repl_func, data)
-    data = re.sub(r'\[\s+', '[', data)
-    data = re.sub(r'],\s+\[', '], [', data)
-    data = re.sub(r'\s+\]', ']', data)
-    with open(output_file, "w") as f:
-        f.write(data)
+        return transfer_timecode(events, fps) if events else []
+
+    except Exception as e:
+        print(f"Error processing {video_path}: {str(e)}")
+        return None
 
 
 if __name__ == "__main__":
@@ -201,6 +281,10 @@ if __name__ == "__main__":
                         help="Root directory containing video files and cutscene_frame_idx.json")
     parser.add_argument("--min-frames", type=int, default=None,
                         help="Minimum number of frames required for each event (default: None)")
+    parser.add_argument("--force-reprocess", action="store_true",
+                        help="Force reprocessing of videos even if they exist in the output JSON")
+    parser.add_argument("--num-workers", type=int, default=8,
+                        help="Number of worker processes for frame extraction (default: 8)")
     args = parser.parse_args()
 
     # Check for cutscene_frame_idx.json
@@ -215,53 +299,70 @@ if __name__ == "__main__":
         print(f"No video files found in {args.videos_root_dir}")
         sys.exit(1)
 
+    # Load cutscene data
+    with open(cutscene_json_path) as f:
+        video_cutscenes = json.load(f)
+
+    # Setup device and model
     device = "cuda"
     model = imagebind_model.imagebind_huge(pretrained=True)
     model.eval()
     model.to(device)
 
-    # Load cutscene data
-    with open(cutscene_json_path) as f:
-        video_cutscenes = json.load(f)
+    # Setup image transform
+    image_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.48145466, 0.4578275, 0.40821073),
+            std=(0.26862954, 0.26130258, 0.27577711),
+        ),
+    ])
 
-    image_transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.48145466, 0.4578275, 0.40821073),
-                std=(0.26862954, 0.26130258, 0.27577711),
-            ),
-        ]
-    )
+    # Output JSON file path
+    output_json_file = os.path.join(args.videos_root_dir, "event_timecode.json")
 
-    video_events = {}
-    for video_path in tqdm(video_paths):
+    # Load existing results
+    existing_results = safely_read_json(output_json_file)
+    print(f"Found {len(existing_results)} previously processed videos")
+
+    # Filter videos to process
+    videos_to_process = []
+    for video_path in video_paths:
         video_basename = os.path.basename(video_path)
+
+        # Skip if video has no cutscene data
         if video_basename not in video_cutscenes:
-            print(f"Warning: Skipping {video_basename} - no cutscene data found")
+            print(f"Skipping {video_basename} - no cutscene data found")
             continue
 
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cutscene = video_cutscenes[video_basename]
+        # Skip if already processed and not force reprocessing
+        if video_basename in existing_results and not args.force_reprocess:
+            print(f"Skipping {video_basename} - already processed")
+            continue
 
-        cutscene_raw_feature, cutscene_raw_status = extract_cutscene_feature(video_path, cutscene)
-        cutscenes, cutscene_feature = verify_cutscene(cutscene, cutscene_raw_feature, cutscene_raw_status, transition_threshold=0.45)
-        events_raw, event_feature_raw = cutscene_stitching(cutscenes, cutscene_feature, eventcut_threshold=0.3)
-        events, event_feature = verify_event(
-            events_raw, event_feature_raw, fps,
-            min_event_len=0.5, max_event_len=10,
-            redundant_event_threshold=0.1,
-            trim_begin_last_percent=0.1,
-            still_event_threshold=0.2,
-            min_frames=args.min_frames
-        )
+        videos_to_process.append(video_path)
 
-        if events:  # Only add events if there are any after filtering
-            video_events[video_basename] = transfer_timecode(events, fps)
+    if not videos_to_process:
+        print("No new videos to process")
+        sys.exit(0)
 
-    # Save results
-    output_json_file = os.path.join(args.videos_root_dir, "event_timecode.json")
-    print(f"\nWriting results to {output_json_file}")
-    write_json_file(video_events, output_json_file)
-    print("Done!")
+    print(f"Processing {len(videos_to_process)} videos")
+
+    # Process videos and update JSON continuously
+    for video_path in tqdm(videos_to_process):
+        video_basename = os.path.basename(video_path)
+        cutscenes = video_cutscenes[video_basename]
+
+        # Process the video
+        events = process_video(video_path, cutscenes, args.min_frames, args.num_workers)
+
+        # Update JSON with results (empty list for videos with no events)
+        # None indicates processing error
+        if events is not None:
+            update_json_with_result(output_json_file, video_basename, events)
+            status = "no events found" if len(events) == 0 else f"found {len(events)} events"
+            print(f"Processed {video_basename} - {status}")
+        else:
+            print(f"Failed to process {video_basename}")
+
+    print("\nDone!")
