@@ -1,6 +1,6 @@
 from scenedetect import detect, ContentDetector
 import cv2
-import os, re, json, argparse, time
+import os, re, json, argparse, time, glob
 from multiprocessing import Pool, cpu_count, Manager
 from functools import partial
 import numpy as np
@@ -117,31 +117,56 @@ def safely_write_json(filepath, data):
             f.write(json_str)
 
 
-def update_json_with_result(output_file, video_name, cutscenes):
-    """Update JSON file with new results"""
-    max_retries = 5
-    for attempt in range(max_retries):
+def get_temp_file_path(videos_root_dir, process_id):
+    """Generate a temporary file path for a specific process"""
+    return os.path.join(videos_root_dir, f"cutscene_frame_idx_temp_{process_id}.json")
+
+
+def merge_temp_files(videos_root_dir, output_json_file):
+    """Merge all temporary JSON files into the main output file"""
+    # Find all temporary files
+    temp_files = glob.glob(os.path.join(videos_root_dir, "cutscene_frame_idx_temp_*.json"))
+
+    if not temp_files:
+        return {}
+
+    # Load and merge data from all temp files
+    merged_data = safely_read_json(output_json_file)
+
+    for temp_file in temp_files:
+        temp_data = safely_read_json(temp_file)
+        merged_data.update(temp_data)
         try:
-            current_data = safely_read_json(output_file)
-            current_data[video_name] = cutscenes
-            safely_write_json(output_file, current_data)
-            break
-        except (TimeoutError, Exception) as e:
-            if attempt == max_retries - 1:
-                print(f"Failed to update results for {video_name} after {max_retries} attempts: {str(e)}")
-            time.sleep(1)
+            os.remove(temp_file)
+        except OSError as e:
+            print(f"Error removing temporary file {temp_file}: {e}")
+
+    # Write merged data to output file
+    safely_write_json(output_json_file, merged_data)
+    return merged_data
 
 
-def process_single_video(video_path, output_file, process_id, progress_dict,
+def recover_from_crash(videos_root_dir, output_json_file):
+    """Check for and recover from a previous crashed execution"""
+    print("Checking for temporary files from previous crashed execution...")
+    merged_data = merge_temp_files(videos_root_dir, output_json_file)
+    if merged_data:
+        print(f"Recovered data for {len(merged_data)} videos from previous execution")
+    return merged_data
+
+
+def process_single_video(video_path, temp_file_path, process_id, progress_dict,
                          cutscene_threshold=25, max_cutscene_len=5, min_scene_len=15):
-    """Process a single video and update JSON file"""
+    """Process a single video and write results to a temporary file"""
     try:
         cutscenes_raw = cutscene_detection(video_path, cutscene_threshold, max_cutscene_len, min_scene_len)
         print(f"Worker {process_id}: Processed {video_path}")
 
-        # Update JSON file with results
+        # Update temporary JSON file with results
         video_name = os.path.basename(video_path)
-        update_json_with_result(output_file, video_name, cutscenes_raw)
+        temp_data = safely_read_json(temp_file_path)
+        temp_data[video_name] = cutscenes_raw
+        safely_write_json(temp_file_path, temp_data)
 
         result = (video_name, cutscenes_raw)
     except Exception as e:
@@ -186,7 +211,10 @@ if __name__ == "__main__":
     # Output JSON file path
     output_json_file = os.path.join(args.videos_root_dir, "cutscene_frame_idx.json")
 
-    # Load existing results
+    # Check for and recover from previous crash
+    recovered_data = recover_from_crash(args.videos_root_dir, output_json_file)
+
+    # Load existing results (including any recovered data)
     existing_results = safely_read_json(output_json_file)
     print(f"Found {len(existing_results)} previously processed videos")
 
@@ -221,16 +249,14 @@ if __name__ == "__main__":
     progress_dict['processed'] = 0
     progress_dict['total'] = total_videos
 
-    # Output JSON file path
-    output_json_file = os.path.join(args.videos_root_dir, "cutscene_frame_idx.json")
-
-    # Process videos in parallel
+    # Process videos in parallel with temporary files
     with Pool(num_workers) as pool:
         results = []
         for i, video_path in enumerate(video_paths):
+            temp_file_path = get_temp_file_path(args.videos_root_dir, i % num_workers)
             result = pool.apply_async(process_single_video,
                                       args=(video_path,
-                                            output_json_file,
+                                            temp_file_path,
                                             i % num_workers,
                                             progress_dict),
                                       kwds={'cutscene_threshold': args.cutscene_threshold,
@@ -241,4 +267,7 @@ if __name__ == "__main__":
         # Get all results
         results = [r.get() for r in results]
 
-    print("\nDone!")
+    # Merge all temporary files into the final output file
+    print("\nMerging temporary files...")
+    merge_temp_files(args.videos_root_dir, output_json_file)
+    print("Done!")
