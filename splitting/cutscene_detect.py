@@ -8,32 +8,56 @@ import sys
 from pathlib import Path
 
 
-def get_video_resolution(video_path):
-    """Get video resolution using OpenCV"""
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    return width, height
-
-
-def get_video_files(root_dir, min_dimension=None):
-    """Recursively find all video files in the given directory with optional resolution filtering"""
+def process_video_path(args):
+    """Process a single video path in parallel, checking resolution and existing results"""
+    root, file, min_dimension, existing_results, force_reprocess, worker_id = args
     video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-    video_files = []
 
+    # Check if it's a video file
+    if not any(file.lower().endswith(ext) for ext in video_extensions):
+        return None
+
+    video_path = os.path.join(root, file)
+    video_name = os.path.basename(video_path)
+
+    # Check if already processed
+    if video_name in existing_results and not force_reprocess:
+        print(f"[Worker {worker_id}] Skipping {video_name} - already processed")
+        return None
+
+    # Check resolution if required
+    if min_dimension is not None:
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+
+        if min(width, height) < min_dimension:
+            print(f"[Worker {worker_id}] Skipping {file} - resolution {width}x{height} below minimum dimension {min_dimension}")
+            return None
+
+    return video_path
+
+
+def parallel_get_video_files(root_dir, min_dimension=None, existing_results=None, force_reprocess=False, num_workers=None):
+    """Parallel implementation of video file discovery and filtering"""
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)
+
+    # Get all potential video files
+    all_files = []
     for root, _, files in os.walk(root_dir):
-        for file in files:
-            if any(file.lower().endswith(ext) for ext in video_extensions):
-                video_path = os.path.join(root, file)
-                if min_dimension is not None:
-                    width, height = get_video_resolution(video_path)
-                    if min(width, height) < min_dimension:
-                        print(f"Skipping {file} - resolution {width}x{height} below minimum dimension {min_dimension}")
-                        continue
-                video_files.append(video_path)
+        for i, file in enumerate(files):
+            worker_id = i % num_workers
+            all_files.append((root, file, min_dimension, existing_results, force_reprocess, worker_id))
 
-    return video_files
+    # Process files in parallel
+    with Pool(num_workers) as pool:
+        video_paths = pool.map(process_video_path, all_files)
+
+    # Filter out None values and return valid paths
+    valid_paths = [path for path in video_paths if path is not None]
+    return valid_paths
 
 
 def cutscene_detection(video_path, cutscene_threshold=25, max_cutscene_len=10, min_scene_len=15):
@@ -160,7 +184,7 @@ def process_single_video(video_path, temp_file_path, process_id, progress_dict,
     """Process a single video and write results to a temporary file"""
     try:
         cutscenes_raw = cutscene_detection(video_path, cutscene_threshold, max_cutscene_len, min_scene_len)
-        print(f"Worker {process_id}: Processed {video_path}")
+        print(f"[Worker {process_id}] Processed {video_path}")
 
         # Update temporary JSON file with results
         video_name = os.path.basename(video_path)
@@ -170,7 +194,7 @@ def process_single_video(video_path, temp_file_path, process_id, progress_dict,
 
         result = (video_name, cutscenes_raw)
     except Exception as e:
-        print(f"Worker {process_id}: Error processing {video_path}: {str(e)}")
+        print(f"[Worker {process_id}] Error processing {video_path}: {str(e)}")
         result = (os.path.basename(video_path), [])
 
     # Update progress
@@ -179,6 +203,34 @@ def process_single_video(video_path, temp_file_path, process_id, progress_dict,
     sys.stderr.flush()
 
     return result
+
+
+def get_videos_to_process(args):
+    """Main function to get videos that need processing"""
+    # Get output JSON file path
+    output_json_file = os.path.join(args.videos_root_dir, "cutscene_frame_idx.json")
+
+    # Check for and recover from previous crash
+    recovered_data = recover_from_crash(args.videos_root_dir, output_json_file)
+
+    # Load existing results (including any recovered data)
+    existing_results = safely_read_json(output_json_file)
+    print(f"Found {len(existing_results)} previously processed videos")
+
+    # Get and filter video files in parallel
+    video_paths = parallel_get_video_files(
+        args.videos_root_dir,
+        args.min_dimension,
+        existing_results,
+        args.force_reprocess,
+        args.num_workers
+    )
+
+    if not video_paths:
+        print(f"No valid video files found in {args.videos_root_dir}")
+        sys.exit(1)
+
+    return video_paths, existing_results, output_json_file
 
 
 if __name__ == "__main__":
@@ -201,37 +253,8 @@ if __name__ == "__main__":
                         help="Force reprocessing of videos even if they exist in the output JSON")
     args = parser.parse_args()
 
-    # Get all video files from the root directory with resolution filtering
-    video_paths = get_video_files(args.videos_root_dir, args.min_dimension)
-
-    if not video_paths:
-        print(f"No valid video files found in {args.videos_root_dir}")
-        sys.exit(1)
-
-    # Output JSON file path
-    output_json_file = os.path.join(args.videos_root_dir, "cutscene_frame_idx.json")
-
-    # Check for and recover from previous crash
-    recovered_data = recover_from_crash(args.videos_root_dir, output_json_file)
-
-    # Load existing results (including any recovered data)
-    existing_results = safely_read_json(output_json_file)
-    print(f"Found {len(existing_results)} previously processed videos")
-
-    # Filter out already processed videos unless force-reprocess is set
-    video_paths_filtered = []
-    for video_path in video_paths:
-        video_name = os.path.basename(video_path)
-        if video_name in existing_results and not args.force_reprocess:
-            print(f"Skipping {video_name} - already processed")
-            continue
-        video_paths_filtered.append(video_path)
-
-    video_paths = video_paths_filtered
-
-    if not video_paths:
-        print("No new videos to process")
-        sys.exit(0)
+    # Get and filter videos to process
+    video_paths, existing_results, output_json_file = get_videos_to_process(args)
 
     # Limit number of videos if specified
     if args.max_videos is not None:
