@@ -14,65 +14,32 @@ from models import imagebind_model
 from models.imagebind_model import ModalityType
 
 
-class FileLock:
-    def __init__(self, file_path):
-        self.file_path = file_path
-        self.lock_path = str(file_path) + ".lock"
-        self.lock_file = None
-
-    def __enter__(self):
-        # Try to acquire lock
-        max_attempts = 60  # Maximum number of attempts (60 seconds timeout)
-        attempts = 0
-        while attempts < max_attempts:
-            try:
-                # Try to create the lock file
-                self.lock_file = open(self.lock_path, 'x')
-                return self
-            except FileExistsError:
-                # Lock file exists, wait and retry
-                time.sleep(1)
-                attempts += 1
-                if attempts >= max_attempts:
-                    raise TimeoutError(f"Could not acquire lock for {self.file_path} after {max_attempts} seconds")
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.lock_file:
-            self.lock_file.close()
-        try:
-            os.remove(self.lock_path)
-        except FileNotFoundError:
-            pass
-
-
 def safely_read_json(filepath):
-    """Read JSON file with file locking"""
+    """Read JSON file without file locking"""
     if not os.path.exists(filepath):
         return {}
 
-    with FileLock(filepath):
-        try:
-            with open(filepath, 'r') as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return {}
+    try:
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return {}
 
 
 def safely_write_json(filepath, data):
-    """Write JSON file with file locking"""
-    with FileLock(filepath):
-        with open(filepath, 'w') as f:
-            json_str = json.dumps(data, indent=4)
+    """Write JSON file without file locking"""
+    with open(filepath, 'w') as f:
+        json_str = json.dumps(data, indent=4)
 
-            def repl_func(match: re.Match):
-                return " ".join(match.group().split())
+        def repl_func(match: re.Match):
+            return " ".join(match.group().split())
 
-            json_str = re.sub(r"(?<=\[)[^\[\]]+(?=])", repl_func, json_str)
-            json_str = re.sub(r'\[\s+', '[', json_str)
-            json_str = re.sub(r'],\s+\[', '], [', json_str)
-            json_str = re.sub(r'\s+\]', ']', json_str)
+        json_str = re.sub(r"(?<=\[)[^\[\]]+(?=])", repl_func, json_str)
+        json_str = re.sub(r'\[\s+', '[', json_str)
+        json_str = re.sub(r'],\s+\[', '], [', json_str)
+        json_str = re.sub(r'\s+\]', ']', json_str)
 
-            f.write(json_str)
+        f.write(json_str)
 
 
 def update_json_with_result(output_file, video_name, events):
@@ -84,7 +51,7 @@ def update_json_with_result(output_file, video_name, events):
             current_data[video_name] = events
             safely_write_json(output_file, current_data)
             break
-        except (TimeoutError, Exception) as e:
+        except Exception as e:
             if attempt == max_retries - 1:
                 print(f"Failed to update results for {video_name} after {max_retries} attempts: {str(e)}")
             time.sleep(1)
