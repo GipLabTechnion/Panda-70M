@@ -42,11 +42,11 @@ def split_video_segment(args):
     video_path, timecode, output_path, i = args
     video_name = os.path.splitext(os.path.basename(video_path))[0]
 
-    start_time = datetime.strptime(timecode[0], '%H:%M:%S.%f')
-    end_time = datetime.strptime(timecode[1], '%H:%M:%S.%f')
-    video_duration = (end_time - start_time).total_seconds()
-
     try:
+        start_time = datetime.strptime(timecode[0], '%H:%M:%S.%f')
+        end_time = datetime.strptime(timecode[1], '%H:%M:%S.%f')
+        video_duration = (end_time - start_time).total_seconds()
+
         result = subprocess.run([
             'ffmpeg', '-hide_banner', '-loglevel', 'panic',
             '-ss', timecode[0],
@@ -59,6 +59,8 @@ def split_video_segment(args):
         success = result.returncode == 0
         return i, success, video_name
     except Exception as e:
+        # Log the error but don't raise it
+        print(f"Failed to process segment {i} of {video_name}: {str(e)}")
         return i, False, video_name
 
 
